@@ -10,8 +10,8 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import config
-from .db import Base, SessionLocal, engine
-from .routers import alerts_api, auth, devices, ingest_api, logs, ops, policies, simulate
+from .db import Base, SessionLocal, engine, ensure_schema
+from .routers import alerts_api, auth, devices, ingest_api, logs, ops, policies, review_api, simulate
 from .seed import seed
 from .services import metrics, quality, recovery, scheduler
 
@@ -45,6 +45,7 @@ def _worker(name: str, fn, interval: float, repeat_while_active: bool = False):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(engine)
+    ensure_schema()
     db = SessionLocal()
     try:
         seed(db)
@@ -77,7 +78,7 @@ app.add_middleware(
 )
 
 for r in (auth.router, devices.router, ingest_api.router, logs.router, policies.router,
-          alerts_api.router, ops.router, simulate.router):
+          alerts_api.router, ops.router, simulate.router, review_api.router):
     app.include_router(r)
 
 

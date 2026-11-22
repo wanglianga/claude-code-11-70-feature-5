@@ -10,6 +10,7 @@ const routes = [
   { path: '/policies', component: () => import('./views/Policies.vue'), meta: { title: '策略台账' } },
   { path: '/recovery', component: () => import('./views/Recovery.vue'), meta: { title: '恢复编排' } },
   { path: '/evidence', component: () => import('./views/Evidence.vue'), meta: { title: '证据链' } },
+  { path: '/review', component: () => import('./views/Review.vue'), meta: { title: '容量决策复盘' } },
   { path: '/simulate', component: () => import('./views/Simulate.vue'), meta: { title: '场景模拟' } },
 ]
 

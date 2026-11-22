@@ -37,6 +37,7 @@ const menus = [
   { path: '/policies', title: '策略台账' },
   { path: '/recovery', title: '恢复编排' },
   { path: '/evidence', title: '证据链' },
+  { path: '/review', title: '容量决策复盘' },
   { path: '/simulate', title: '场景模拟' },
 ]
 const username = computed(() => localStorage.getItem('username') || '')

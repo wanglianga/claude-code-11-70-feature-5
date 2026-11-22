@@ -27,7 +27,9 @@ router = APIRouter(prefix="/api", tags=["ops"])
 
 
 def _counts_by_partition(db, status_filter=None):
-    q = db.query(ReceiveLog.partition_key, func.count(ReceiveLog.id))
+    q = db.query(ReceiveLog.partition_key, func.count(ReceiveLog.id)).filter(
+        ReceiveLog.scenario_id.is_(None)  # 生产口径排除复盘模拟通道
+    )
     if status_filter:
         q = q.filter(ReceiveLog.status == status_filter)
     return dict(q.group_by(ReceiveLog.partition_key).all())
@@ -40,11 +42,13 @@ def list_partitions(db: Session = Depends(get_db), _: User = Depends(require_use
     batched = dict(
         db.query(ReceiveLog.partition_key, func.count(BatchItem.id))
         .join(BatchItem, BatchItem.receive_log_id == ReceiveLog.id)
+        .filter(ReceiveLog.scenario_id.is_(None))
         .group_by(ReceiveLog.partition_key)
         .all()
     )
     processed = dict(
         db.query(QualityConclusion.partition_key, func.count(QualityConclusion.id))
+        .filter(QualityConclusion.scenario_id.is_(None))
         .group_by(QualityConclusion.partition_key)
         .all()
     )
@@ -127,14 +131,23 @@ def scheduler_state(db: Session = Depends(get_db), _: User = Depends(require_use
 
 @router.get("/dashboard/summary")
 def dashboard_summary(db: Session = Depends(get_db), _: User = Depends(require_user)):
-    total = db.query(ReceiveLog).count()
-    by_status = dict(db.query(ReceiveLog.status, func.count(ReceiveLog.id)).group_by(ReceiveLog.status).all())
+    total = db.query(ReceiveLog).filter(ReceiveLog.scenario_id.is_(None)).count()
+    by_status = dict(
+        db.query(ReceiveLog.status, func.count(ReceiveLog.id))
+        .filter(ReceiveLog.scenario_id.is_(None))
+        .group_by(ReceiveLog.status)
+        .all()
+    )
     open_alerts = db.query(Alert).filter(Alert.status == "open").count()
     max_latency = db.query(func.max(Alert.latency_ms)).scalar() or 0
     avg_latency = db.query(func.avg(Alert.latency_ms)).scalar() or 0
     conflicts = db.query(ReadingConflict).count()
-    conclusions = db.query(QualityConclusion).count()
-    pending_review = db.query(QualityConclusion).filter(QualityConclusion.conclusion == "pending_review").count()
+    conclusions = db.query(QualityConclusion).filter(QualityConclusion.scenario_id.is_(None)).count()
+    pending_review = (
+        db.query(QualityConclusion)
+        .filter(QualityConclusion.conclusion == "pending_review", QualityConclusion.scenario_id.is_(None))
+        .count()
+    )
     st = get_state(db)
     return {
         "total_received": total,
@@ -173,7 +186,7 @@ def list_conclusions(
     db: Session = Depends(get_db),
     _: User = Depends(require_user),
 ):
-    q = db.query(QualityConclusion)
+    q = db.query(QualityConclusion).filter(QualityConclusion.scenario_id.is_(None))
     if conclusion:
         q = q.filter(QualityConclusion.conclusion == conclusion)
     if device_point:

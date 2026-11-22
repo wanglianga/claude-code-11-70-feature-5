@@ -10,6 +10,7 @@ from sqlalchemy import (
     Index,
     Integer,
     String,
+    Text,
 )
 
 
@@ -99,6 +100,7 @@ class ReceiveLog(Base):
     risk_level = Column(String(16))
     status = Column(String(16), nullable=False, default="confirmed", index=True)
     note = Column(String(256), default="")
+    scenario_id = Column(String(64), nullable=True, index=True)  # 复盘模拟通道（live 为空）
     received_at = Column(DateTime, default=utcnow, index=True)
 
 
@@ -127,6 +129,8 @@ class Policy(Base):
     priority_json = Column(JSON)  # {"high":100,"medium":50,"low":10}
     reserve_high_writes = Column(Integer, default=50)  # 降级时为高风险分区保留的写入额度 %
     active = Column(Boolean, default=False)
+    effective_ts = Column(DateTime, nullable=True)  # 策略生效业务时刻（用于顺序规范）
+    event_seq = Column(BigInteger, nullable=True)  # 生效事件登记序号（同一时刻裁定先后）
     created_at = Column(DateTime, default=utcnow)
     note = Column(String(256), default="")
 
@@ -142,6 +146,8 @@ class Batch(Base):
     recovery_run_id = Column(Integer, nullable=True)
     status = Column(String(16), default="open", index=True)  # open/processing/done
     item_count = Column(Integer, default=0)
+    scenario_id = Column(String(64), nullable=True, index=True)  # 复盘模拟通道（live 为空）
+    create_event_seq = Column(BigInteger, nullable=True)  # 批次生成的预登记事件序号（同刻裁定用）
     created_at = Column(DateTime, default=utcnow)
     processed_at = Column(DateTime, nullable=True)
 
@@ -151,6 +157,7 @@ class BatchItem(Base):
     id = Column(BigInteger, primary_key=True)
     batch_id = Column(BigInteger, index=True)
     receive_log_id = Column(BigInteger, unique=True)  # 一条日志至多入批一次
+    scenario_id = Column(String(64), nullable=True)
     created_at = Column(DateTime, default=utcnow)
 
 
@@ -175,6 +182,7 @@ class QualityConclusion(Base):
     conclusion = Column(String(16))
     confirmed = Column(Boolean, default=True)
     detail = Column(String(512), default="")
+    scenario_id = Column(String(64), nullable=True, index=True)  # 复盘模拟通道（live 为空）
     created_at = Column(DateTime, default=utcnow)
 
 
@@ -254,3 +262,109 @@ class DerivedTrend(Base):
     avg_value = Column(Float)
     sample_count = Column(Integer)
     created_at = Column(DateTime, default=utcnow)
+
+
+# ---------------------------------------------------------------------------
+# 容量决策复盘（capacity decision review）
+#
+# 核心不变量：
+#   * decision_events 是不可变事件序列。同一生效时刻的事件不按数据库写入先后，
+#     而按登记时派发的 event_seq 裁定先后（顺序规范器）。
+#   * queue_checkpoints 保存可供回溯的队列水位与调度游标；journal 模式额外把
+#     每一次队列比较与评分明细写入 decision_events(payload.detail)。
+#   * review_runs 是已签发的复盘结论：只新增版本，不原地改写已签发内容。
+#
+# lane: live=生产台账（真实调度写入）；scenario:<id>=隔离的模拟复现通道，
+#       只被复盘服务读取，不参与真实调度/质量消费，也不出现在常规运维列表。
+# ---------------------------------------------------------------------------
+
+
+class DecisionEvent(Base):
+    """不可变决策事件：接收/批次生成/策略生效/批次完成/队列比较/检查点等。"""
+
+    __tablename__ = "decision_events"
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    lane = Column(String(64), nullable=False, default="live", index=True)
+    # 顺序规范器：同一生效时刻按 event_seq 裁定先后；跨时刻按 effective_ts 排序
+    event_seq = Column(BigInteger, nullable=False, index=True)
+    kind = Column(String(32), nullable=False, index=True)
+    # receive | batch_create | policy_effective | batch_complete
+    # | decision | checkpoint | late_arrival
+    effective_ts = Column(DateTime, nullable=False, index=True)  # 生效时刻（业务时间）
+    recorded_at = Column(DateTime, default=utcnow)  # 实际写入时刻（仅作审计，不参与排序）
+    actor = Column(String(64), default="system")
+    partition_key = Column(String(32), index=True)
+    receive_log_id = Column(BigInteger, index=True)
+    batch_id = Column(BigInteger, index=True)
+    policy_version = Column(Integer)
+    payload = Column(JSON)  # 结构化明细（含队列水位/游标/评分明细/差异说明）
+    note = Column(String(256), default="")
+
+
+Index("ix_decision_events_lane_seq", DecisionEvent.lane, DecisionEvent.event_seq)
+Index("ix_decision_events_lane_ts", DecisionEvent.lane, DecisionEvent.effective_ts)
+
+
+class QueueCheckpoint(Base):
+    """状态保全：某时刻的分区队列水位与调度游标快照，用于区间重放的起始锚点。"""
+
+    __tablename__ = "queue_checkpoints"
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    lane = Column(String(64), nullable=False, default="live", index=True)
+    checkpoint_seq = Column(BigInteger, nullable=False)  # 对应的最后一条已折叠事件序号
+    effective_ts = Column(DateTime, nullable=False, index=True)
+    degraded = Column(Boolean, default=False)
+    policy_version = Column(Integer)
+    # {"P-HIGH-1": {"backlog":5,"batched":12,"processed":10,"inflight":2,
+    #               "confirmed_cursor":..,"batched_cursor":..,"processed_cursor":..}}
+    partitions_json = Column(JSON)
+    scheduler_cursor = Column(BigInteger, default=0)  # 已调度到的全局接收序号
+    detail = Column(JSON)
+    created_at = Column(DateTime, default=utcnow)
+
+
+Index("ix_queue_checkpoints_lane_ts", QueueCheckpoint.lane, QueueCheckpoint.effective_ts)
+
+
+class ReviewRun(Base):
+    """已签发的复盘结论（按 lane + scope 版本化；补传晚到不改写，只追加新版本）。"""
+
+    __tablename__ = "review_runs"
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    lane = Column(String(64), nullable=False, default="live", index=True)
+    scope_kind = Column(String(16), nullable=False)  # alert | interval | scenario
+    scope_key = Column(String(128), nullable=False)  # 告警 id / 区间标识 / 场景 id
+    target_receive_log_id = Column(BigInteger, nullable=True)
+    window_start = Column(DateTime, nullable=False)
+    window_end = Column(DateTime, nullable=False)
+    version = Column(Integer, nullable=False, default=1)
+    supersedes_version = Column(Integer, nullable=True)  # 补传晚到生成的新版本指向被替代版本
+    status = Column(String(16), default="issued")  # issued（已签发，不可改写）
+    verdict = Column(String(32), default="")  # capacity_exhausted/low_risk_blocked/policy_switch/insufficient/unknown
+    summary = Column(String(512), default="")
+    precision = Column(String(16), default="")  # event_grade | checkpoint_grade | insufficient
+    cost_note = Column(String(256), default="")
+    result_json = Column(JSON)  # 完整复盘（时间线/反事实/差异说明）
+    diff_json = Column(JSON)  # 相对被替代版本的差异说明
+    issued_by = Column(String(64), default="system")
+    issued_at = Column(DateTime, default=utcnow)
+    content_hash = Column(String(64), default="")
+
+
+Index("ix_review_runs_scope", ReviewRun.lane, ReviewRun.scope_kind, ReviewRun.scope_key, ReviewRun.version)
+
+
+class ScenarioRun(Base):
+    """模拟序列的登记与版本信息（一次回放/复核产生一个新版本行）。"""
+
+    __tablename__ = "scenario_runs"
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    scenario_key = Column(String(64), nullable=False, index=True)  # capacity / low_risk / policy_race
+    label = Column(String(128), default="")
+    lane = Column(String(64), nullable=False)
+    version = Column(Integer, default=1)
+    status = Column(String(16), default="ready")
+    note = Column(String(256), default="")
+    detail = Column(JSON)
+    created_at = Column(DateTime, default=utcnow)
+

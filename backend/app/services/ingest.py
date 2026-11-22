@@ -3,6 +3,7 @@ import threading
 from datetime import datetime
 
 from ..models import Device, GatewaySession, Partition, ReadingConflict, ReceiveLog
+from . import decision_ledger as ledger
 from .common import maybe_slow
 
 # 同一会话的接入串行化，保证“同会话+同序列”的判定与写入是原子的
@@ -93,7 +94,25 @@ def ingest_readings(db, gateway_code: str, session_uuid: str, readings, note: st
                 part = db.get(Partition, device.partition_key)
                 if part is not None and log.id > (part.confirmed_cursor or 0):
                     part.confirmed_cursor = log.id
-                    db.commit()
+                db.commit()
+                # 读取确认即登记一条不可变接收事件（生效时刻=接收时刻）。
+                ledger.record_event(
+                    db,
+                    "receive",
+                    log.received_at or now,
+                    lane=ledger.LIVE,
+                    partition_key=log.partition_key,
+                    receive_log_id=log.id,
+                    payload={
+                        "device_point": log.device_point,
+                        "value": log.value,
+                        "risk_level": log.risk_level,
+                        "gateway_code": gateway_code,
+                    },
+                    actor="gateway",
+                    note="实时通道接收确认",
+                )
+                db.commit()
             elif status == "conflict":
                 db.add(
                     ReadingConflict(

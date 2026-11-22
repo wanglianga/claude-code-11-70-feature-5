@@ -2,6 +2,7 @@ from datetime import datetime, timedelta
 
 from sqlalchemy import case
 
+from .. import config
 from ..models import (
     Batch,
     BatchItem,
@@ -12,6 +13,7 @@ from ..models import (
     ReceiveLog,
 )
 from . import alerts
+from . import decision_ledger as ledger
 from .common import get_state
 
 
@@ -124,5 +126,35 @@ def quality_tick(db) -> bool:
     part = db.get(Partition, batch.partition_key)
     if part is not None and max_log_id > (part.processed_cursor or 0):
         part.processed_cursor = max_log_id
+    # 批次完成是不可变事件；其生效时刻与策略切换同刻时，由预登记序号裁定先后。
+    if batch.scenario_id is None:
+        ledger.record_event(
+            db,
+            "batch_complete",
+            batch.processed_at,
+            lane=ledger.LIVE,
+            partition_key=batch.partition_key,
+            batch_id=batch.id,
+            policy_version=batch.policy_version,
+            actor="quality",
+            payload={"item_count": batch.item_count, "source": batch.source},
+            note=f"批次 #{batch.id} 完成",
+        )
+        if ledger.mode_info()["mode"] == "checkpoint":
+            _maybe_checkpoint(db, lane=ledger.LIVE)
     db.commit()
     return True
+
+
+_cp_timer = [0.0]
+
+
+def _maybe_checkpoint(db, lane: str) -> None:
+    """周期检查点：降低日常写入量；长区间复盘以此作为重放起点。"""
+    import time
+
+    now = time.time()
+    if now - _cp_timer[0] < config.REVIEW_CHECKPOINT_INTERVAL_SEC:
+        return
+    _cp_timer[0] = now
+    ledger.write_checkpoint(db, lane, note="周期检查点（批次完成触发）")

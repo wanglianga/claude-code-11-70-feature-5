@@ -29,6 +29,19 @@ SCHED_TICK_LIMIT = int(os.getenv("SCHED_TICK_LIMIT", "200"))
 # 恢复编排器每次运行单分区回补上限
 RECOVERY_MAX_ITEMS = int(os.getenv("RECOVERY_MAX_ITEMS", "500"))
 
+# 容量决策复盘：
+#   台账保留模式 —— journal(逐次队列比较+评分明细，查询最快但写入量大)
+#                | checkpoint(周期检查点+不可变事件序列，日常成本低，长区间需更多重放计算)
+REVIEW_LEDGER_MODE = os.getenv("REVIEW_LEDGER_MODE", "checkpoint")
+# 复盘响应目标（秒）：影响策略建议中重建精度与成本的取舍
+REVIEW_RESPONSE_TARGET_SEC = int(os.getenv("REVIEW_RESPONSE_TARGET_SEC", "5"))
+# 周期检查点间隔（秒）
+REVIEW_CHECKPOINT_INTERVAL_SEC = int(os.getenv("REVIEW_CHECKPOINT_INTERVAL_SEC", "300"))
+# 峰值事件量假设（事件/秒），用于成本边界估算
+REVIEW_PEAK_EVENT_RATE = int(os.getenv("REVIEW_PEAK_EVENT_RATE", "50"))
+# 监管保留期（天）
+REVIEW_RETENTION_DAYS = int(os.getenv("REVIEW_RETENTION_DAYS", "365"))
+
 # 前端构建产物目录（存在时由后端直接托管，便于单进程本地运行）
 FRONTEND_DIST = os.getenv(
     "FRONTEND_DIST",

@@ -1,11 +1,13 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func
 from sqlalchemy.orm import Session
+from datetime import datetime
 
 from ..db import get_db
 from ..models import Batch, Policy, QualityConclusion, User
 from ..schemas import PolicyIn
 from ..security import require_user
+from ..services import decision_ledger as ledger
 
 router = APIRouter(prefix="/api", tags=["policies"])
 
@@ -29,7 +31,7 @@ def list_policies(db: Session = Depends(get_db), _: User = Depends(require_user)
 
 
 @router.post("/policies")
-def create_policy(body: PolicyIn, db: Session = Depends(get_db), _: User = Depends(require_user)):
+def create_policy(body: PolicyIn, db: Session = Depends(get_db), user: User = Depends(require_user)):
     max_ver = db.query(func.max(Policy.version)).scalar() or 0
     if body.activate:
         db.query(Policy).update({Policy.active: False})
@@ -42,8 +44,32 @@ def create_policy(body: PolicyIn, db: Session = Depends(get_db), _: User = Depen
         note=body.note,
     )
     db.add(p)
+    db.flush()
+    # 策略生效登记为不可变事件：生效时刻 = 发布时刻，事件序号在登记时派发。
+    # 若批次完成与切换同一生效时刻，顺序规范器按 event_seq 裁定，而非数据库写入先后。
+    effective_ts = datetime.utcnow()
+    ev = ledger.record_event(
+        db,
+        "policy_effective",
+        effective_ts,
+        lane=ledger.LIVE,
+        policy_version=p.version,
+        actor=user.username,
+        payload={
+            "version": p.version,
+            "name": p.name,
+            "priority": body.priority,
+            "reserve_high_writes": body.reserve_high_writes,
+            "activate": body.activate,
+        },
+        note="策略版本生效",
+    )
+    p.effective_ts = effective_ts
+    p.event_seq = ev.event_seq
     db.commit()
     db.refresh(p)
+    ledger.write_checkpoint(db, ledger.LIVE, effective_ts=effective_ts, note="策略切换时保全队列水位")
+    db.commit()
     return policy_to_dict(p)
 
 

@@ -22,6 +22,9 @@ services:
       SECRET_KEY: change-me-in-prod
       INGEST_TOKEN: ingest-dev-token
       WRITE_LATENCY_THRESHOLD_MS: "800"
+      REVIEW_LEDGER_MODE: "checkpoint"
+      REVIEW_CHECKPOINT_INTERVAL_SEC: "300"
+      REVIEW_RETENTION_DAYS: "365"
     depends_on:
       db:
         condition: service_healthy
